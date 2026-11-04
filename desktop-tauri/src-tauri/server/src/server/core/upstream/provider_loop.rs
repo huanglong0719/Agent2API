@@ -16,11 +16,13 @@
 //! 只是每个账号的属性（决定用哪个适配器发）。候选池按 provider 过滤只剩一个
 //! 目的：不把不提供该模型的家的账号放进来。
 //!
-//! ── 错误分类怎么驱动控制流（架构文档 §4.2 的三个动作）────────
+//! ── 错误分类怎么驱动控制流（架构文档 §4.2 + 内容拦截一档）────
 //!   1. `QuotaLimited` → 标记该账号对该模型冷却 + 换下一个候选账号；
 //!   2. `TokenExpired` → 调 `refresh_access_token` 刷新凭证，**同一账号**
 //!      原样重试一次（只一次：再失败按普通失败处理，不会空转）；
-//!   3. `Fatal` → 原样透传给客户端。
+//!   3. `ContentBlocked` → 先换中性提示词在同一账号补救一次；仍被拒则排除
+//!      该提供商并换到下一家，不罚账号；
+//!   4. `Fatal` → 原样透传给客户端。
 //!
 //! 分类由适配器给出，本模块只按这三档行动 —— 于是「11128 要退避、6004 是限额」
 //! 这类 provider 知识全在适配器里，本文件对「上游是哪一家」一无所知。
@@ -49,8 +51,9 @@
 //! 上游按**逐字**匹配审核，撞上就是 HTTP 400 —— 那多半是客户端 system 模板
 //! 的指纹误报（见 `core::sanitize`）。补救分两步：**换最小中性提示词立刻重发
 //! 一次**（就在下面的账号内发送循环里，与 401 刷新重试同一位置），并触发降级
-//! 状态机（`core::degrade`）让后续请求直接带中性提示词出门。两步都不换账号、
-//! 不罚账号 —— 内容问题不是账号问题（照搬参考项目的 `ErrContentBlocked`）。
+//! 状态机（`core::degrade`）让后续请求直接带中性提示词出门。若补救后仍被拒，
+//! 本请求会排除这家并换到其他能承载该模型的提供商；后续选路也不会绕回来撞
+//! 同一家的另一个账号。整个过程不罚账号 —— 内容问题不是账号问题。
 //!
 //! ── 旁路记账（usage）────────────────────────────────────────
 //! 每一轮账号尝试都 `telemetry.note_attempt(...)`，并带上 provider id ——
@@ -170,6 +173,19 @@ fn take_switch(switches_left: &mut usize, total: usize) -> bool {
     }
     *switches_left -= 1;
     true
+}
+
+/// 从候选提供商中移除已经因内容策略拒绝而排除的家。
+///
+/// 内容策略拒绝只说明这份请求在该通道不可用，不说明账号坏了：同一家的另一个
+/// 账号仍然会收到同一份 body，结论不会变化。因此排除单位是 **provider**，
+/// 不是单个账号。
+fn providers_excluding<'a>(providers: &[&'a str], excluded: &[String]) -> Vec<&'a str> {
+    providers
+        .iter()
+        .copied()
+        .filter(|provider| !excluded.iter().any(|blocked| blocked.as_str() == *provider))
+        .collect()
 }
 
 /// 失败之后往队列的下一个账号**顺延**：动作 3 与「构造期本地失败」共用的一条路。
@@ -356,8 +372,9 @@ fn transport_retry_advice(error: &super::request::UpstreamRequestError, remainin
 ///   - `TokenExpired`（401）：有专属动作（刷新凭证后同账号重试一次），
 ///     走到这里说明已经刷过一轮仍失败，重发没有新变量；
 ///   - `ContentBlocked`（内容策略拦截）：也有专属动作（换中性提示词重发一次，
-///     见 `attempt_queue` 的动作 0），走到这里说明那次补救已经用掉 ——
-///     再原地重发同一份 body 结论不变（拦的是字节，不是账号）；
+///     见 `attempt_queue` 的动作 0），走到这里说明那次补救已经用掉；随后会
+///     排除当前 provider 并换家 —— 再原地重发同一份 body 结论不变（拦的是
+///     字节与通道，不是账号）；
 ///   - `Fatal` + **413**（见 [`PAYLOAD_SIZE_REJECTION_STATUSES`]）：上游入口按请求体
 ///     字节数拒收（实测 Loomy 的网关回 `{"error_code":"APIG.0201","error_msg":
 ///     "Request entity too large"}`），判据里没有任何会变的量。而代价不对称：
@@ -599,6 +616,10 @@ async fn attempt_queue(
     }
     let mut conversation_ids = None;
     let mut tried_ids: Vec<String> = Vec::new();
+    // 内容策略拒绝按 provider 记录：同一家的另一个账号会收到同一份请求体，
+    // 重试只会确定性撞墙。后续所有选路（含限额降级、普通失败顺延）都必须读
+    // 这份过滤后的候选链，不能在某个分支又退回完整 `provider_ids`。
+    let mut content_blocked_providers: Vec<String> = Vec::new();
     // ── 两份独立的预算（见 config::RetrySettings）─────────────────────
     //   - `budget`：同一个账号上还能**原地重发**几次。整份请求共用一份，
     //     由 `send_with_retry` 逐次扣减 —— 于是它天然花在「第一个真正发出去的
@@ -647,6 +668,8 @@ async fn attempt_queue(
     // 裸 `continue` 会回到内层（用同一个账号再发一次，正好是要避免的事）。
     // `continue 'accounts` 才表达「换队列里的下一个账号」。
     'accounts: for _ in 0..=MAX_ROUTE_ATTEMPTS {
+        let routed_provider_ids =
+            providers_excluding(provider_ids, &content_blocked_providers);
         // ── 手动终止：每一轮选路之前先看令牌 ────────────────────────
         // 覆盖「回到循环」的所有时刻：去重排队、退避睡眠、换号顺延、上游
         // 响应之后的下一轮。更细的等待点（等响应头、退避）由 `send_with_retry`
@@ -657,7 +680,7 @@ async fn attempt_queue(
         }
         let mut target = rotate::select_target_account(
             service,
-            provider_ids,
+            &routed_provider_ids,
             &cooldown_keys,
             &tried_ids,
             ctx.pinned_account,
@@ -770,7 +793,7 @@ async fn attempt_queue(
                     }
                     match rotate::pick_next_account(
                         service,
-                        provider_ids,
+                        &routed_provider_ids,
                         &cooldown_keys,
                         &tried_ids,
                         ctx.pinned_account,
@@ -908,7 +931,7 @@ async fn attempt_queue(
                     }
                     match rotate::pick_next_account(
                         service,
-                        provider_ids,
+                        &routed_provider_ids,
                         &cooldown_keys,
                         &tried_ids,
                         ctx.pinned_account,
@@ -1160,7 +1183,7 @@ async fn attempt_queue(
                     }
                     if defer_to_next_account(
                         service,
-                        provider_ids,
+                        &routed_provider_ids,
                         &cooldown_keys,
                         &mut tried_ids,
                         &target,
@@ -1546,6 +1569,63 @@ async fn attempt_queue(
                         Some(i64::from(failure.error.status_code)),
                         Some(&failure.error.message),
                     );
+                    // ── 动作 0b：中性提示词补救后仍被内容策略拒绝 → 换家 ─────
+                    // 同一家的另一个账号会收到同一份请求体，重试只会确定性再撞一次；
+                    // 但内容拒绝不是账号故障，所以这里不写限流、不进退避、不记熔断。
+                    // 候选链按 provider 排除，后续限额降级 / 普通顺延也不会绕回这家。
+                    if matches!(failure.class, UpstreamErrorClass::ContentBlocked { .. }) {
+                        if let Some(account_id) = target.account_id.clone() {
+                            if !tried_ids.contains(&account_id) {
+                                tried_ids.push(account_id);
+                            }
+                        }
+                        if !content_blocked_providers
+                            .iter()
+                            .any(|blocked| blocked.as_str() == provider_id)
+                        {
+                            content_blocked_providers.push(provider_id.to_string());
+                        }
+                        let fallback_provider_ids =
+                            providers_excluding(provider_ids, &content_blocked_providers);
+                        let next = if fallback_provider_ids.is_empty() {
+                            None
+                        } else {
+                            rotate::pick_next_account(
+                                service,
+                                &fallback_provider_ids,
+                                &cooldown_keys,
+                                &tried_ids,
+                                ctx.pinned_account,
+                                &ctx.routing,
+                            )
+                        };
+                        match next {
+                            Some(next) => {
+                                if !take_switch(&mut switches_left, switch_total) {
+                                    return Err(failure.error);
+                                }
+                                let rejected = crate::server::core::providers::label_of(provider_id);
+                                let next_label = account_display(&next);
+                                let next_provider = rotate::provider_of(&next);
+                                let next_home = kind_from_id(next_provider)
+                                    .map(|kind| meta(kind).label)
+                                    .unwrap_or(next_provider);
+                                ctx.telemetry.note_attempt_notice(
+                                    "内容策略拦截已排除当前提供商，后续不重试同一家",
+                                );
+                                logging::console_line(
+                                    "[Upstream]",
+                                    &format!(
+                                        "⚠️ 提供商 {rejected} 对模型 {model} 内容策略拦截\
+                                         （HTTP {}），已排除该提供商并切换 → {next_label}（{next_home}）",
+                                        failure.error.status_code,
+                                    ),
+                                );
+                                continue 'accounts;
+                            }
+                            None => return Err(failure.error),
+                        }
+                    }
                     // ── 动作 1：限额 → 标记冷却 + 换下一个账号 ──────────
                     if let (
                         UpstreamErrorClass::QuotaLimited {
@@ -1596,7 +1676,7 @@ async fn attempt_queue(
                             }
                             match rotate::pick_next_account(
                                 service,
-                                provider_ids,
+                                &routed_provider_ids,
                                 &cooldown_keys,
                                 &tried_ids,
                                 ctx.pinned_account,
@@ -1661,7 +1741,7 @@ async fn attempt_queue(
                                     // 原句，逐字与改造前相同。
                                     let earliest_reset = rotate::earliest_limit_reset_at(
                                         service,
-                                        provider_ids,
+                                        &routed_provider_ids,
                                         &cooldown_keys,
                                     );
                                     let wait_hint = if earliest_reset > 0 {
@@ -1757,7 +1837,7 @@ async fn attempt_queue(
                     // 失败」共用同一条路，判据不该有两份。
                     if defer_to_next_account(
                         service,
-                        provider_ids,
+                        &routed_provider_ids,
                         &cooldown_keys,
                         &mut tried_ids,
                         &target,
@@ -1936,7 +2016,7 @@ async fn attempt_queue(
                     };
                     match rotate::pick_next_account(
                         service,
-                        provider_ids,
+                        &routed_provider_ids,
                         &cooldown_keys,
                         &tried_ids,
                         ctx.pinned_account,
