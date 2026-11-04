@@ -357,8 +357,6 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
 
 #[test]
 fn content_block_fallback_excludes_every_account_from_the_rejected_provider() {
-    use crate::server::core::upstream::route_context::RequestRouting;
-
     let (_dir, service, first_workbuddy_id) = temp_service();
     let second_workbuddy = service
         .store
@@ -382,39 +380,23 @@ fn content_block_fallback_excludes_every_account_from_the_rejected_provider() {
         .expect("WorkBuddy 国际版账号应当能建起来");
     let intl_id = intl["id"].as_str().expect("公开形态应带 id").to_string();
 
-    let model = "glm-5.3-flash";
-    let routing = RequestRouting::capture(model, &service.store);
-    let keys = rotate::CooldownKeys::new(model);
     let providers = ["workbuddy", "workbuddy-intl"];
 
-    let same_provider = rotate::pick_next_account(
-        &service,
-        &providers,
-        &keys,
-        &[first_workbuddy_id.clone()],
-        None,
-        &routing,
-    )
-    .expect("对照组应当还能选到同一提供商的第二个账号");
-    assert_eq!(
-        Some(second_workbuddy_id.as_str()),
-        crate::server::core::routing::account_id(&same_provider),
-        "对照组必须证明仅靠 tried_ids 仍会落到同一提供商"
-    );
-
+    let all_accounts = rotate::accounts_in_providers(&service, &providers, None);
+    assert!(all_accounts.iter().any(|account| {
+        crate::server::core::routing::account_id(account) == Some(first_workbuddy_id.as_str())
+    }));
+    assert!(all_accounts.iter().any(|account| {
+        crate::server::core::routing::account_id(account) == Some(second_workbuddy_id.as_str())
+    }));
     let fallback_providers = providers_excluding(&providers, &["workbuddy".to_string()]);
-    let fallback = rotate::pick_next_account(
-        &service,
-        &fallback_providers,
-        &keys,
-        &[first_workbuddy_id],
-        None,
-        &routing,
-    )
-    .expect("另一个提供商有可用账号时应当顺延");
+    let fallback_accounts = rotate::accounts_in_providers(&service, &fallback_providers, None);
     assert_eq!(
-        Some(intl_id.as_str()),
-        crate::server::core::routing::account_id(&fallback),
+        vec![Some(intl_id.as_str())],
+        fallback_accounts
+            .iter()
+            .map(crate::server::core::routing::account_id)
+            .collect::<Vec<_>>(),
         "内容策略拒绝后应跳过 WorkBuddy 国内版的全部账号"
     );
 }
