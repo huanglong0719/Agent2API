@@ -64,7 +64,9 @@ pub fn plan(
     }
     let mut change = Change::load(path.to_path_buf())?;
     let original = files::text(change.before.as_deref())?;
-    let mut value = if def.id == "workbuddy" && original.trim().is_empty() {
+    let dsh_patch = def.id == "dsh"
+        && path.file_name().is_some_and(|name| name == "cordis.patch.yml");
+    let mut value = if (def.id == "workbuddy" || dsh_patch) && original.trim().is_empty() {
         json!([])
     } else {
         files::parse(def.format, &original)?

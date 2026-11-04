@@ -47,7 +47,9 @@ pub fn save_override(def: &ClientDef, raw: &str) -> Result<(), String> {
                 .file_name()
                 .is_some_and(|name| name == "provider_config.json"),
             "crush" => path.file_name().is_some_and(|name| name == "crush.json"),
-            "dsh" => path.file_name().is_some_and(|name| name == "settings.yaml"),
+            "dsh" => path.file_name().is_some_and(|name| {
+                name == "settings.yaml" || name == "cordis.patch.yml"
+            }),
             "cursor-cli" => path
                 .file_name()
                 .is_some_and(|name| name == "cli-config.json"),
@@ -91,6 +93,31 @@ fn env_dir(key: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn dsh_candidates(home: &Path) -> Vec<PathBuf> {
+    let profiles = home.join("profiles");
+    let mut names: Vec<String> = std::fs::read_dir(&profiles)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect();
+    names.sort_by_key(|name| match name.as_str() {
+        "desktop" => (0, name.clone()),
+        "web" => (1, name.clone()),
+        "headless" => (2, name.clone()),
+        _ => (3, name.clone()),
+    });
+    let mut paths: Vec<PathBuf> = names
+        .into_iter()
+        .map(|name| profiles.join(name).join("cordis.patch.yml"))
+        .collect();
+    paths.push(home.join("cordis.patch.yml"));
+    // 旧版 DSH 的全局 settings.yaml 只在没有 profile patch 时作为兼容入口。
+    paths.push(home.join("settings.yaml"));
+    paths
+}
+
 pub fn candidates(def: &ClientDef) -> Vec<PathBuf> {
     let home = home();
     let xdg = env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"));
@@ -102,7 +129,7 @@ pub fn candidates(def: &ClientDef) -> Vec<PathBuf> {
             .unwrap_or_else(|| home.clone())
             .join(".gemini/settings.json")],
         "zcode" => vec![home.join(".zcode/v2/provider_config.json")],
-        "dsh" => vec![dir("DSH_HOME", ".dsh").join("settings.yaml")],
+        "dsh" => dsh_candidates(&dir("DSH_HOME", ".dsh")),
         "workbuddy" => vec![
             dir("WORKBUDDY_CONFIG_DIR", ".workbuddy").join("models.json"),
             home.join(".codebuddy/models.json"),
@@ -177,6 +204,26 @@ pub struct Detection {
     pub note: Option<String>,
 }
 
+fn choose_path(
+    override_path: Option<PathBuf>,
+    paths: &[PathBuf],
+    fallback_index: usize,
+) -> (PathBuf, bool) {
+    let auto_path = paths.iter().find(|path| path.is_file()).cloned();
+    let override_is_file = override_path.as_ref().is_some_and(|path| path.is_file());
+    let used_override = override_is_file && auto_path.as_ref() != override_path.as_ref();
+    let path = override_path
+        .as_ref()
+        .filter(|path| path.is_file())
+        .cloned()
+        .or(auto_path)
+        .or(override_path)
+        .or_else(|| paths.get(fallback_index).cloned())
+        .or_else(|| paths.first().cloned())
+        .unwrap_or_default();
+    (path, used_override)
+}
+
 pub fn detect(def: &ClientDef) -> Detection {
     let preferences = preferences();
     let preference_error = preferences.as_ref().err().cloned();
@@ -184,18 +231,14 @@ pub fn detect(def: &ClientDef) -> Detection {
         .ok()
         .and_then(|mut preferences| preferences.paths.remove(def.id));
     let paths = candidates(def);
-    let path = override_path
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| paths.iter().find(|path| path.is_file()).cloned())
-        .or_else(|| {
-            if def.id == "opencode" {
-                paths.get(1).cloned()
-            } else {
-                paths.first().cloned()
-            }
-        })
-        .unwrap_or_default();
+    let override_path = override_path.map(PathBuf::from);
+    // 失效的手动路径不能盖住仍然存在的默认配置。只有覆盖路径真的存在时才优先，
+    // 否则先采用自动发现结果；两者都不存在时仍保留手写路径供用户修正。
+    let (path, used_override) = choose_path(
+        override_path,
+        &paths,
+        if def.id == "opencode" { 1 } else { 0 },
+    );
     let mut evidence = Vec::new();
     if path.is_file() {
         evidence.push(format!("发现配置文件: {}", path.display()));
@@ -206,7 +249,7 @@ pub fn detect(def: &ClientDef) -> Detection {
             path.with_file_name(".env").display()
         ));
     }
-    if override_path.is_some() {
+    if used_override {
         evidence.push("使用手动指定的配置路径".into());
     }
     let binary = find_binary(def);
@@ -377,4 +420,69 @@ pub fn kimi_legacy(path: &Path) -> bool {
     path.parent()
         .and_then(Path::file_name)
         .is_some_and(|name| name == ".kimi")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "agent2api-agent-paths-{}-{}-{tag}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::SeqCst)
+            ));
+            std::fs::create_dir_all(&path).expect("临时目录应当能创建");
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_missing_override_does_not_hide_an_existing_auto_path() {
+        let dir = TempDir::new("override");
+        let auto = dir.0.join("cordis.patch.yml");
+        std::fs::write(&auto, "[]\n").unwrap();
+        let missing = dir.0.join("settings.yaml");
+        let (path, manual) = choose_path(Some(missing), &[auto.clone()], 0);
+        assert_eq!(auto, path);
+        assert!(!manual);
+    }
+
+    #[test]
+    fn an_existing_override_stays_authoritative() {
+        let dir = TempDir::new("manual");
+        let auto = dir.0.join("auto.yml");
+        let manual = dir.0.join("manual.yml");
+        std::fs::write(&auto, "[]\n").unwrap();
+        std::fs::write(&manual, "[]\n").unwrap();
+        let (path, used_manual) = choose_path(Some(manual.clone()), &[auto], 0);
+        assert_eq!(manual, path);
+        assert!(used_manual);
+    }
+
+    #[test]
+    fn dsh_discovery_prefers_the_desktop_profile_patch() {
+        let dir = TempDir::new("dsh");
+        std::fs::create_dir_all(dir.0.join("profiles/custom")).unwrap();
+        std::fs::create_dir_all(dir.0.join("profiles/desktop")).unwrap();
+        let candidates = dsh_candidates(&dir.0);
+        assert_eq!(
+            Some(&dir.0.join("profiles/desktop/cordis.patch.yml")),
+            candidates.first()
+        );
+        assert!(candidates.contains(&dir.0.join("profiles/custom/cordis.patch.yml")));
+        assert_eq!(Some(&dir.0.join("settings.yaml")), candidates.last());
+    }
 }
