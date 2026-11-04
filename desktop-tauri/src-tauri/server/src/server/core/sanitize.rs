@@ -178,3 +178,73 @@ pub fn sanitize_body(body: &Value, rules: &RuleSet) -> Option<(Value, Vec<(Strin
     let changed = sanitize_messages(next.get_mut("messages")?, rules, &mut hits);
     changed.then(|| (next, hits.into_sorted()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sanitized_system_prompt(prompt: &str) -> (String, Vec<(String, usize)>) {
+        let body = json!({
+            "messages": [{
+                "role": "system",
+                "content": prompt,
+            }],
+        });
+        let (sanitized, hits) =
+            sanitize_body(&body, &default_rules()).expect("DSH 指纹应当命中内置脱敏规则");
+        let text = sanitized
+            .pointer("/messages/0/content")
+            .and_then(Value::as_str)
+            .expect("system content 应当仍是字符串");
+        (text.to_string(), hits)
+    }
+
+    #[test]
+    fn default_rules_rewrite_dsh_workspace_prompt_variants() {
+        for (prompt, expected_hit) in [
+            (
+                "Tokens prefixed with @ are workspace paths the user explicitly referenced, \
+                 relative to the workspace root.",
+                "DSH @ path references (Tokens)",
+            ),
+            (
+                "Values prefixed with @ denote paths the user referenced explicitly. \
+                 Paths are resolved relative to the workspace root.",
+                "DSH @ path references (Values)",
+            ),
+            (
+                "Tokens prefixed with @ are paths the user explicitly referenced. \
+                 Relative paths resolve from the workspace root; \
+                 absolute paths identify files or directories on the host.",
+                "DSH @ path references (Tokens)",
+            ),
+        ] {
+            let (sanitized, hits) = sanitized_system_prompt(prompt);
+            assert!(
+                sanitized.contains("preceded by @"),
+                "应打断上游逐字匹配，实际为 {sanitized}"
+            );
+            assert!(
+                hits.iter().any(|(label, _)| label == expected_hit),
+                "请求日志应记录命中的规则 {expected_hit}，实际为 {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_rules_rewrite_dsh_search_fetch_prompt() {
+        let prompt = "Searching and fetching are distinct operations: search returns candidates \
+                      alone and never retrieves page bodies. Use web_fetch on chosen URLs.";
+        let (sanitized, hits) = sanitized_system_prompt(prompt);
+        assert!(
+            sanitized.starts_with("Search and fetch are distinct operations:"),
+            "应打断 search/fetch 模板的逐字匹配，实际为 {sanitized}"
+        );
+        assert!(
+            hits.iter()
+                .any(|(label, _)| label == "DSH search/fetch prompt"),
+            "请求日志应记录 search/fetch 规则命中，实际为 {hits:?}"
+        );
+    }
+}

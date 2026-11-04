@@ -277,6 +277,30 @@ fn default_entries() -> Vec<SanitizeRule> {
             r"(?i)\bDeepSeek[ \t]+Harness\b",
             "DeepSeek",
         ),
+        (
+            "dsh-at-reference-tokens",
+            "DSH @ path references (Tokens)",
+            r"\bTokens prefixed with @",
+            "Tokens preceded by @",
+        ),
+        (
+            "dsh-at-reference-values",
+            "DSH @ path references (Values)",
+            r"\bValues prefixed with @",
+            "Values preceded by @",
+        ),
+        (
+            "dsh-relative-path-prompt",
+            "DSH relative path prompt",
+            r"\bRelative paths resolve",
+            "Relative paths are resolved",
+        ),
+        (
+            "dsh-search-fetch-prompt",
+            "DSH search/fetch prompt",
+            r"\bSearching and fetching are distinct operations:",
+            "Search and fetch are distinct operations:",
+        ),
     ] {
         entries.push(SanitizeRule {
             id: id.to_string(),
