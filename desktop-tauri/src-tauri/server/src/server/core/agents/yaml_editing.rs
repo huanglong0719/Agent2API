@@ -1,9 +1,9 @@
 //! YAML 配置的原位读写。
 //!
-//! 读用 serde_yaml；写只改本次要改的叶子：映射逐层下沉，非映射值（数组、标量）整体替换 ——
-//! 与 DeepSeek Harness 自己的 settings 写入是同一个口径，因此未被触及的行（含注释、缩进、
-//! 行尾风格）逐字保留。定位不到（流式写法、根不是块状映射、块标量等）一律拒绝写入，最后再用
-//! 「重新解析 == 期望值」兜底：宁可报错，也不写出结构对不上原文的文件。
+//! 读用 serde_yaml；写只改本次要改的叶子：映射逐层下沉，非映射值（数组、标量）整体替换。
+//! DSH 当前的 profile patch 是顶层 `id` 映射数组，按 id 原位编辑；旧版 settings.yaml 仍是
+//! 块状映射。两条路径都保留未触及的行、注释、缩进与行尾风格。定位不到（流式写法、块标量、
+//! 无 id 数组项等）一律拒绝写入，最后用「重新解析 == 期望值」兜底。
 
 use serde_json::{json, Value};
 
@@ -18,9 +18,31 @@ pub fn parse(text: &str) -> Result<Value, String> {
 pub fn render(original: &str, desired: &Value) -> Result<String, String> {
     let bom = original.starts_with('\u{feff}');
     let text = original.trim_start_matches('\u{feff}');
+    if text.trim().is_empty() && desired.is_array() {
+        let mut rendered = serde_yaml::to_string(desired)
+            .map_err(|error| format!("生成 YAML 配置失败: {error}"))?;
+        if bom {
+            rendered.insert(0, '\u{feff}');
+        }
+        if parse(&rendered)? != *desired {
+            return Err("配置编辑结果与预期不一致，已停止写入".into());
+        }
+        return Ok(rendered);
+    }
     let before = parse(text)?;
     if before == *desired {
         return Ok(original.to_string());
+    }
+    if before.is_array() && desired.is_array() {
+        let rendered = render_id_array(text, &before, desired)?;
+        let mut rendered = rendered;
+        if bom {
+            rendered.insert(0, '\u{feff}');
+        }
+        if parse(&rendered)? != *desired {
+            return Err("配置编辑结果与预期不一致，已停止写入".into());
+        }
+        return Ok(rendered);
     }
     let mut edits = Vec::new();
     diff(&[], &before, desired, &mut edits);
@@ -68,6 +90,212 @@ fn child(path: &[String], key: &str) -> Vec<String> {
     next
 }
 
+/// 顶层 `id` 映射数组（DSH profile patch）中的一项。
+#[derive(Clone, Copy)]
+struct ListItem {
+    start: usize,
+    end: usize,
+    indent: usize,
+}
+
+/// 编辑由唯一 `id` 键标识的顶层映射数组。
+///
+/// profile patch 的每一项是 `{ id, name?, config? }`。这里按 id 修改已有项、
+/// 删除缺失项并追加新项，不会把无关 patch 重排或重写成另一种 YAML。
+fn render_id_array(original: &str, before: &Value, desired: &Value) -> Result<String, String> {
+    let before_items = before.as_array().ok_or("原配置不是数组")?;
+    let desired_items = desired.as_array().ok_or("目标配置不是数组")?;
+    for item in before_items.iter().chain(desired_items) {
+        item_id(item)?;
+    }
+    let eol = if original.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = original
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_string())
+        .collect();
+    let Some(first) = find_list_items(&lines).first().copied() else {
+        return Err("配置数组缺少可定位的 id 项".into());
+    };
+    let root_indent = first.indent;
+
+    // 先改已有项。每次编辑后重新定位，避免块长度变化让后续行号失效。
+    for target in desired_items {
+        let id = item_id(target)?;
+        let Some(current) = before_items
+            .iter()
+            .find(|item| item_id(item).is_ok_and(|value| value == id))
+        else {
+            continue;
+        };
+        if current == target {
+            continue;
+        }
+        let mut edits = Vec::new();
+        diff(&[], current, target, &mut edits);
+        for (path, value) in edits {
+            let item = find_list_item(&lines, root_indent, &id)
+                .ok_or_else(|| format!("配置缺少 id={id} 的项"))?;
+            let region = list_child_region(&lines, item);
+            apply_at(&mut lines, region, &path, value.as_ref())?;
+        }
+    }
+
+    // 删除目标里不存在的项。
+    for current in before_items {
+        let id = item_id(current)?;
+        if !desired_items
+            .iter()
+            .any(|item| item_id(item).is_ok_and(|value| value == id))
+        {
+            let item = find_list_item(&lines, root_indent, &id)
+                .ok_or_else(|| format!("配置缺少 id={id} 的项"))?;
+            lines.drain(item.start..item.end);
+        }
+    }
+
+    // 追加新项，保持目标数组中的顺序。
+    let insert_at = lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |index| index + 1);
+    let mut appended = Vec::new();
+    for target in desired_items {
+        let id = item_id(target)?;
+        if !before_items
+            .iter()
+            .any(|item| item_id(item).is_ok_and(|value| value == id))
+        {
+            appended.extend(render_list_item(target, root_indent)?);
+        }
+    }
+    if !appended.is_empty() {
+        lines.splice(insert_at..insert_at, appended);
+    }
+    Ok(lines.join(eol))
+}
+
+fn item_id(value: &Value) -> Result<String, String> {
+    let object = value
+        .as_object()
+        .ok_or("顶层配置数组的每一项都必须是映射")?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or("顶层配置数组的每一项都必须有非空 id")?;
+    Ok(id.to_string())
+}
+
+fn find_list_items(lines: &[String]) -> Vec<ListItem> {
+    let Some(root_indent) = lines.iter().find_map(|line| root_list_indent(line)) else {
+        return Vec::new();
+    };
+    let starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            (leading_indent(line) == root_indent
+                && line.trim_start().starts_with("- ")
+                && list_line_id(line).is_some())
+            .then_some(index)
+        })
+        .collect();
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, start)| {
+            let raw_end = starts
+                .get(index + 1)
+                .copied()
+                .unwrap_or_else(|| trailing_content_end(lines));
+            ListItem {
+                start: *start,
+                end: trim_list_trailer(lines, *start, raw_end, root_indent),
+                indent: root_indent,
+            }
+        })
+        .collect()
+}
+
+fn find_list_item(lines: &[String], root_indent: usize, id: &str) -> Option<ListItem> {
+    find_list_items(lines)
+        .into_iter()
+        .find(|item| {
+            lines
+                .get(item.start)
+                .and_then(|line| list_line_id(line))
+                .as_deref()
+                == Some(id)
+                && item.indent == root_indent
+        })
+}
+
+fn list_child_region(lines: &[String], item: ListItem) -> Region {
+    let start = item.start + 1;
+    let indent = (start..item.end)
+        .find(|index| !is_ignorable(&lines[*index]))
+        .map(|index| leading_indent(&lines[index]))
+        .unwrap_or(item.indent + 2);
+    Region {
+        start,
+        end: item.end,
+        indent,
+    }
+}
+
+fn render_list_item(value: &Value, indent: usize) -> Result<Vec<String>, String> {
+    let object = value
+        .as_object()
+        .ok_or("新配置项必须是映射")?;
+    let id = item_id(value)?;
+    let pad = pad(indent);
+    let mut lines = vec![format!(
+        "{pad}- id: {}",
+        render_scalar(&Value::String(id))?
+    )];
+    for (key, value) in object {
+        if key != "id" {
+            lines.extend(render_entry(key, value, indent + 2)?);
+        }
+    }
+    Ok(lines)
+}
+
+fn root_list_indent(line: &str) -> Option<usize> {
+    (!is_ignorable(line) && line.trim_start().starts_with("- ") && list_line_id(line).is_some())
+        .then(|| leading_indent(line))
+}
+
+fn list_line_id(line: &str) -> Option<String> {
+    let after_dash = line.trim_start().strip_prefix("- ")?;
+    let suffix = key_suffix(after_dash, "id")?;
+    let (value, _) = split_value(suffix);
+    serde_yaml::from_str::<String>(value.trim()).ok()
+}
+
+fn trailing_content_end(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .rposition(|line| !line.trim().is_empty())
+        .map_or(0, |index| index + 1)
+}
+
+fn trim_list_trailer(lines: &[String], start: usize, raw_end: usize, indent: usize) -> usize {
+    let mut end = raw_end;
+    while end > start + 1 {
+        let line = &lines[end - 1];
+        if line.trim().is_empty()
+            || (leading_indent(line) <= indent && line.trim_start().starts_with('#'))
+        {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
 /// 一个映射的直接子块；`end` 已排除块尾的空行与注释。
 #[derive(Clone, Copy)]
 struct Region {
@@ -86,8 +314,17 @@ struct Entry {
 }
 
 fn apply(lines: &mut Vec<String>, path: &[String], value: Option<&Value>) -> Result<(), String> {
+    let region = root(lines)?;
+    apply_at(lines, region, path, value)
+}
+
+fn apply_at(
+    lines: &mut Vec<String>,
+    mut region: Region,
+    path: &[String],
+    value: Option<&Value>,
+) -> Result<(), String> {
     let (key, parents) = path.split_last().ok_or("配置路径不能为空")?;
-    let mut region = root(lines)?;
     for parent in parents {
         region = match find(lines, &region, parent) {
             Some(entry) => descend(lines, &entry, &region)?,
@@ -360,4 +597,72 @@ fn split_value(suffix: &str) -> (String, String) {
     }
     let value = trimmed[..cut].trim_end();
     (value.to_string(), trimmed[value.len()..].to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn id_arrays_preserve_unrelated_patch_entries_and_comments() {
+        let original = "\
+# user patch layer
+- id: first
+  name: First
+  config:
+    enabled: true
+- id: second
+  name: Second
+  config:
+    keep: yes
+";
+        let desired = json!([
+            {
+                "id": "first",
+                "name": "First",
+                "config": { "enabled": false },
+            },
+            {
+                "id": "second",
+                "name": "Second",
+                "config": { "keep": true },
+            },
+            {
+                "id": "third",
+                "name": "Third",
+                "config": { "added": "yes" },
+            },
+        ]);
+        let rendered = render(original, &desired).expect("DSH patch 数组应当能原位编辑");
+        assert!(rendered.contains("# user patch layer"));
+        assert!(rendered.contains("enabled: false"));
+        assert!(rendered.contains("keep: true"));
+        assert!(rendered.contains("- id: third"));
+        assert_eq!(parse(&rendered).unwrap(), desired);
+    }
+
+    #[test]
+    fn id_arrays_remove_only_the_target_entry() {
+        let original = "\
+- id: first
+  config:
+    value: one
+# second explains the next override
+- id: second
+  config:
+    value: two
+";
+        let desired = json!([
+            {
+                "id": "second",
+                "config": { "value": 3 },
+            },
+        ]);
+        let rendered = render(original, &desired).expect("应当删除并更新独立 patch 项");
+        assert!(!rendered.contains("id: first"));
+        assert!(rendered.contains("# second explains"));
+        assert!(rendered.contains("value: 3"));
+        assert_eq!(parse(&rendered).unwrap(), desired);
+    }
 }

@@ -90,7 +90,9 @@ fn client_view(def: &ClientDef, gateway: &str) -> Value {
         "icon": format!("assets/agents/{}", def.icon), "iconFull": def.icon_full,
         "configPath": detection.path.display().to_string(),
         "resolvedPath": detection.path.display().to_string(),
-        "pathOverride": paths::path_override(def.id).unwrap_or_default(),
+        "pathOverride": paths::path_override(def.id)
+            .filter(|raw| std::path::Path::new(raw) == detection.path.as_path())
+            .unwrap_or_default(),
         "format": def.format.as_str(), "configMode": def.behavior,
         "protocol": def.protocols.first().copied().unwrap_or(""), "protocols": def.protocols,
         "installed": detection.detected, "detected": detection.detected,

@@ -1,9 +1,10 @@
 //! DeepSeek Harness（`dsh`）的适配。
 //!
-//! 模型提供商写在用户设置 `~/.dsh/settings.yaml` 的 `llm-pi-ai.providers.<路由>` 下；密钥不在
-//! 这里 —— DSH 的设置只存凭据引用（`apiKeyEnv` 是环境变量名），值放在同目录的
-//! `.credentials.yaml` 的 `refs` 下，因此接入要同时改两个文件。两处都是 DSH 运行时按需读取的
-//! 用户层，改完不需要重启，刷新已打开的页面即可看到新提供商。
+//! 当前 DSH 把用户配置写在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 的
+//! `llm-pi-ai` 与 `agent-default-model` patch 项里；旧版本使用 `~/.dsh/settings.yaml`。
+//! 两种布局都支持，托管文件以实际检测到的路径为准。密钥不在配置里 —— `apiKeyEnv`
+//! 是凭据引用名，值放在 `DSH_HOME/.credentials.yaml` 的 `refs` 下，因此接入会改配置与
+//! 凭据两个文件。两处都是 DSH 运行时按需读取的用户层，改完无需重启。
 //!
 //! 字段与取值依据是 DSH 0.1.2-rc.1 的 `@deepseek-ai/dsh-llm-pi-ai`（已装在本机，直接读的类型
 //! 定义）与 `dsh-credentials-local`：
@@ -31,6 +32,84 @@ const NAMESPACE: &str = "llm-pi-ai";
 const DEFAULT_MODEL: &str = "agent-default-model";
 /// DSH 允许列出的思考档位，顺序即设置页的展示顺序。
 const LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+const LLM_NAME: &str = "@deepseek-ai/dsh-llm-pi-ai";
+const DEFAULT_MODEL_NAME: &str = "@deepseek-ai/dsh-agent-default-model";
+
+fn patch_config<'a>(value: &'a Value, id: &str) -> Option<&'a Value> {
+    if value.is_object() {
+        return value.get(id);
+    }
+    value
+        .as_array()?
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(id))?
+        .get("config")
+}
+
+fn patch_config_mut_existing<'a>(value: &'a mut Value, id: &str) -> Option<&'a mut Value> {
+    if value.is_object() {
+        return value.get_mut(id).filter(|entry| entry.is_object());
+    }
+    let index = value
+        .as_array()?
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(id))?;
+    value.as_array_mut()?.get_mut(index)?.get_mut("config")
+}
+
+fn patch_config_mut<'a>(
+    value: &'a mut Value,
+    id: &str,
+    name: &str,
+) -> Result<&'a mut Value, String> {
+    if value.is_object() {
+        let object = value.as_object_mut().expect("object checked");
+        if !object.get(id).is_some_and(Value::is_object) {
+            object.insert(id.to_string(), json!({}));
+        }
+        return Ok(object.get_mut(id).expect("inserted or existing object"));
+    }
+    let entries = value
+        .as_array_mut()
+        .ok_or("DSH profile patch 根节点必须是数组")?;
+    let index = match entries
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+    {
+        Some(index) => index,
+        None => {
+            entries.push(json!({ "id": id, "name": name, "config": {} }));
+            entries.len() - 1
+        }
+    };
+    let entry = entries[index]
+        .as_object_mut()
+        .ok_or_else(|| format!("DSH profile patch 的 id={id} 项必须是映射"))?;
+    if !entry.get("config").is_some_and(Value::is_object) {
+        entry.insert("config".to_string(), json!({}));
+    }
+    Ok(entry.get_mut("config").expect("config inserted or existing object"))
+}
+
+fn prune_empty_patch(value: &mut Value, id: &str) {
+    let Some(entries) = value.as_array_mut() else {
+        return;
+    };
+    let Some(index) = entries
+        .iter()
+        .position(|entry| entry.get("id").and_then(Value::as_str) == Some(id))
+    else {
+        return;
+    };
+    let empty = entries[index]
+        .get("config")
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty);
+    if empty {
+        entries.remove(index);
+    }
+}
 
 fn api_of(protocol: &str) -> Option<&'static str> {
     match protocol {
@@ -114,14 +193,14 @@ fn references(path: &Path) -> Result<Map<String, Value>, String> {
 }
 
 pub fn read(path: &Path, value: &Value) -> Result<Vec<Profile>, String> {
-    let Some(providers) = value
-        .pointer(&format!("/{NAMESPACE}/providers"))
+    let Some(providers) = patch_config(value, NAMESPACE)
+        .and_then(|config| config.get("providers"))
         .and_then(Value::as_object)
     else {
         return Ok(Vec::new());
     };
     let refs = references(path)?;
-    let selection = value.get(DEFAULT_MODEL);
+    let selection = patch_config(value, DEFAULT_MODEL);
     let active = selection
         .and_then(|value| value.get("provider"))
         .and_then(Value::as_str)
@@ -304,10 +383,9 @@ pub fn write(
         return Err("请填写 DSH 的接口基址".into());
     }
     let route = route_of(&profile.native.source_id, profile);
-    let existing = value
-        .get(NAMESPACE)
-        .and_then(|value| value.get("providers"))
-        .and_then(|value| value.get(route.as_str()));
+    let existing = patch_config(value, NAMESPACE)
+        .and_then(|config| config.get("providers"))
+        .and_then(|providers| providers.get(route.as_str()));
     let mut entry = native_entry(existing, &profile.native.entry)?;
     set(
         &mut entry,
@@ -360,15 +438,16 @@ pub fn write(
         }
         None => {}
     }
-    set(value, &["llm-pi-ai", "providers", &route], entry)?;
-    let selected = value
-        .get(DEFAULT_MODEL)
-        .and_then(|value| value.get("provider"))
+    let llm = patch_config_mut(value, NAMESPACE, LLM_NAME)?;
+    set(llm, &["providers", &route], entry)?;
+    let selected = patch_config(value, DEFAULT_MODEL)
+        .and_then(|config| config.get("provider"))
         .and_then(Value::as_str)
         == Some(route.as_str());
     if (operation == "default" || selected) && !profile.model.trim().is_empty() {
-        set(value, &[DEFAULT_MODEL, "provider"], json!(route))?;
-        set(value, &[DEFAULT_MODEL, "model"], json!(profile.model.trim()))?;
+        let selection = patch_config_mut(value, DEFAULT_MODEL, DEFAULT_MODEL_NAME)?;
+        set(selection, &["provider"], json!(route))?;
+        set(selection, &["model"], json!(profile.model.trim()))?;
         // 网关目录把「关闭思考」写作 off / none 两档，DSH 只有 off。
         let effort = match profile.effort.trim() {
             "" | "default" => None,
@@ -376,15 +455,15 @@ pub fn write(
             other => Some(other),
         };
         match effort {
-            Some(effort) => set(value, &[DEFAULT_MODEL, "reasoningEffort"], json!(effort))?,
-            None => remove(value, &[DEFAULT_MODEL, "reasoningEffort"]),
+            Some(effort) => set(selection, &["reasoningEffort"], json!(effort))?,
+            None => remove(selection, &["reasoningEffort"]),
         }
     }
     let mut extra = Vec::new();
     if let Some((reference, key)) = pending {
         extra.push(credential_change(path, &reference, Some(&key))?);
         warnings.push(
-            "同时修改 settings.yaml 与 .credentials.yaml（密钥只以引用名出现在设置里）。".into(),
+            "同时修改 DSH 配置与 .credentials.yaml（密钥只以引用名出现在配置里）。".into(),
         );
     }
     Ok(extra)
@@ -445,14 +524,25 @@ fn supported(store: &Value, path: &Path) -> Result<(), String> {
 
 pub fn delete(path: &Path, value: &mut Value, profile: &Profile) -> Result<Vec<Change>, String> {
     let route = route_of(&profile.native.source_id, profile);
-    remove(value, &[NAMESPACE, "providers", &route]);
-    let selected = value
-        .get(DEFAULT_MODEL)
-        .and_then(|value| value.get("provider"))
+    let selected = patch_config(value, DEFAULT_MODEL)
+        .and_then(|config| config.get("provider"))
         .and_then(Value::as_str)
         == Some(route.as_str());
-    if selected {
-        // 默认模型指向被删的提供商时 DSH 会解析不出模型；移除这段让它回到自带默认。
+    if let Some(llm) = patch_config_mut_existing(value, NAMESPACE) {
+        remove(llm, &["providers", &route]);
+    }
+    prune_empty_patch(value, NAMESPACE);
+    if value.is_array() {
+        if selected {
+            if let Some(selection) = patch_config_mut_existing(value, DEFAULT_MODEL) {
+                remove(selection, &["provider"]);
+                remove(selection, &["model"]);
+                remove(selection, &["reasoningEffort"]);
+            }
+            prune_empty_patch(value, DEFAULT_MODEL);
+        }
+    } else if selected {
+        // 旧 settings.yaml 的默认模型指向被删提供商时整段移除，回到 DSH 自带默认。
         remove(value, &[DEFAULT_MODEL]);
     }
     let mut extra = Vec::new();
@@ -461,4 +551,96 @@ pub fn delete(path: &Path, value: &mut Value, profile: &Profile) -> Result<Vec<C
         extra.push(credential_change(path, &credential_ref(&route), None)?);
     }
     Ok(extra)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn patch_document() -> Value {
+        yaml_editing::parse(
+            r#"
+- id: llm-pi-ai
+  name: "@deepseek-ai/dsh-llm-pi-ai"
+  config:
+    providers:
+      cc:
+        displayName: Agent2API
+        apiKeyEnv: CC_API_KEY
+        api: openai-responses
+        baseURL: http://127.0.0.1:3065/v1
+        models:
+          - id: deepseek-v4.1-flash
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: cc
+    model: deepseek-v4.1-flash
+    reasoningEffort: high
+"#,
+        )
+        .expect("测试 patch 应当是合法 YAML")
+    }
+
+    fn temp_patch_path() -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("agent2api-dsh-{}", std::process::id()))
+            .join("profiles/desktop/cordis.patch.yml")
+    }
+
+    #[test]
+    fn reads_current_profile_patch_layout() {
+        let path = temp_patch_path();
+        let profiles = read(&path, &patch_document()).expect("应当读取 DSH profile patch");
+        assert_eq!(1, profiles.len());
+        assert_eq!("cc", profiles[0].native.source_id);
+        assert_eq!("responses", profiles[0].protocol);
+        assert_eq!("http://127.0.0.1:3065/v1", profiles[0].base_url);
+        assert_eq!("deepseek-v4.1-flash", profiles[0].model);
+        assert!(profiles[0].enabled);
+    }
+
+    #[test]
+    fn writes_and_deletes_current_profile_patch_layout() {
+        let path = temp_patch_path();
+        let mut value = patch_document();
+        let mut profile = Profile::new(
+            "agent2api",
+            "Agent2API",
+            "responses",
+            "http://127.0.0.1:3065/v1",
+        );
+        profile.model = "glm-5.3-flash".into();
+        profile.native.source_id = "agent2api".into();
+        let mut warnings = Vec::new();
+        let extra = write(
+            &path,
+            &mut value,
+            &profile,
+            "default",
+            &mut warnings,
+        )
+        .expect("应当写入 DSH profile patch");
+        assert!(extra.is_empty());
+        assert!(warnings.is_empty());
+        let providers = patch_config(&value, NAMESPACE)
+            .and_then(|config| config.get("providers"))
+            .and_then(Value::as_object)
+            .expect("providers 映射应当存在");
+        assert_eq!(
+            Some("http://127.0.0.1:3065/v1"),
+            providers["agent2api"]["baseURL"].as_str()
+        );
+        let selection = patch_config(&value, DEFAULT_MODEL).expect("默认模型 patch 应当存在");
+        assert_eq!(Some("agent2api"), selection["provider"].as_str());
+        assert_eq!(Some("glm-5.3-flash"), selection["model"].as_str());
+
+        delete(&path, &mut value, &profile).expect("应当从 profile patch 删除");
+        let providers = patch_config(&value, NAMESPACE)
+            .and_then(|config| config.get("providers"))
+            .and_then(Value::as_object)
+            .expect("providers 映射应当存在");
+        assert!(!providers.contains_key("agent2api"));
+        assert!(patch_config(&value, DEFAULT_MODEL).is_none());
+    }
 }
