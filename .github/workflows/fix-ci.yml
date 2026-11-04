@@ -1,0 +1,33 @@
+name: fix-ci
+
+on:
+  push:
+    branches:
+      - test/content-blocked-provider-fallback-v2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fix-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop-tauri/src-tauri -> ../../target
+
+      - name: Run targeted regression tests
+        run: |
+          cargo test -p agent2api-server content_block_fallback_excludes_the_whole_rejected_provider -- --test-threads=1
+          cargo test -p agent2api-server default_rules_rewrite_dsh -- --test-threads=1
+        working-directory: desktop-tauri/src-tauri
