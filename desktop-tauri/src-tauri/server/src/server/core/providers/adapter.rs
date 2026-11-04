@@ -12,7 +12,8 @@
 //!   2. [`UpstreamErrorClass::TokenExpired`] → 刷新凭证后**同一账号**重试一次；
 //!   3. [`UpstreamErrorClass::ContentBlocked`] → **不罚账号**：换中性提示词后同一
 //!      账号立即重试一次，并触发降级状态机（`core::degrade`；照搬参考项目的
-//!      `ErrContentBlocked` 语义 —— 那是审核误报，不是账号问题）；
+//!      `ErrContentBlocked` 语义 —— 那是审核误报，不是账号问题）；补救后仍被拒
+//!      则排除该 provider，并换到其他能承载该模型的提供商；
 //!   4. [`UpstreamErrorClass::Fatal`]        → 原样透传给客户端。
 //!
 //! 这四档是转发编排唯一认识的错误处理方式，适配器只能在这四档里归类 ——

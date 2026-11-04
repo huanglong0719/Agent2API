@@ -353,6 +353,21 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
 }
 
 #[test]
+fn content_block_fallback_excludes_the_whole_rejected_provider() {
+    let providers = ["workbuddy", "catpaw", "workbuddy-intl"];
+    let fallback_providers = providers_excluding(&providers, &["workbuddy".to_string()]);
+    assert_eq!(
+        vec!["catpaw", "workbuddy-intl"],
+        fallback_providers,
+        "内容策略拒绝后应排除整个 provider，而不是只跳过当前账号"
+    );
+    assert!(
+        providers_excluding(&["workbuddy"], &["workbuddy".to_string()]).is_empty(),
+        "没有其他 provider 时应让请求收尾，不能绕回同一家"
+    );
+}
+
+#[test]
 fn a_deterministic_404_skips_the_in_place_resend() {
     // issue #255 的形状：OfficeAce 对目录里有、套餐里没有的名字回
     // `404 {"code":null,"message":"Invalid model."}`，旧判据把它当普通 Fatal，
