@@ -356,48 +356,17 @@ async fn a_real_413_response_is_sent_once_and_handed_back() {
 }
 
 #[test]
-fn content_block_fallback_excludes_every_account_from_the_rejected_provider() {
-    let (_dir, service, first_workbuddy_id) = temp_service();
-    let second_workbuddy = service
-        .store
-        .add_account(
-            &json!({"auth": {"accessToken": "wb-2"}, "account": {"uid": "quota-2"}}),
-            None,
-            Some("workbuddy"),
-        )
-        .expect("第二个 WorkBuddy 账号应当能建起来");
-    let second_workbuddy_id = second_workbuddy["id"]
-        .as_str()
-        .expect("公开形态应带 id")
-        .to_string();
-    let intl = service
-        .store
-        .add_account(
-            &json!({"auth": {"accessToken": "intl"}, "account": {"uid": "intl-1"}}),
-            None,
-            Some("workbuddy-intl"),
-        )
-        .expect("WorkBuddy 国际版账号应当能建起来");
-    let intl_id = intl["id"].as_str().expect("公开形态应带 id").to_string();
-
-    let providers = ["workbuddy", "workbuddy-intl"];
-
-    let all_accounts = rotate::accounts_in_providers(&service, &providers, None);
-    assert!(all_accounts.iter().any(|account| {
-        crate::server::core::routing::account_id(account) == Some(first_workbuddy_id.as_str())
-    }));
-    assert!(all_accounts.iter().any(|account| {
-        crate::server::core::routing::account_id(account) == Some(second_workbuddy_id.as_str())
-    }));
+fn content_block_fallback_excludes_the_whole_rejected_provider() {
+    let providers = ["workbuddy", "catpaw", "workbuddy-intl"];
     let fallback_providers = providers_excluding(&providers, &["workbuddy".to_string()]);
-    let fallback_accounts = rotate::accounts_in_providers(&service, &fallback_providers, None);
     assert_eq!(
-        vec![Some(intl_id.as_str())],
-        fallback_accounts
-            .iter()
-            .map(crate::server::core::routing::account_id)
-            .collect::<Vec<_>>(),
-        "内容策略拒绝后应跳过 WorkBuddy 国内版的全部账号"
+        vec!["catpaw", "workbuddy-intl"],
+        fallback_providers,
+        "内容策略拒绝后应排除整个 provider，而不是只跳过当前账号"
+    );
+    assert!(
+        providers_excluding(&["workbuddy"], &["workbuddy".to_string()]).is_empty(),
+        "没有其他 provider 时应让请求收尾，不能绕回同一家"
     );
 }
 

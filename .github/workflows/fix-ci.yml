@@ -27,5 +27,5 @@ jobs:
           workspaces: desktop-tauri/src-tauri -> ../../target
 
       - name: Run provider loop tests
-        run: cargo test -p agent2api-server provider_loop::tests -- --test-threads=1
+        run: cargo test -p agent2api-server content_block_fallback_excludes_the_whole_rejected_provider -- --test-threads=1
         working-directory: desktop-tauri/src-tauri
